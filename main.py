@@ -13,11 +13,14 @@ from aiogram.types import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# ✅ чат модерации (твой)
+# ✅ чат модерации
 MOD_CHAT_ID = -1003496458501
 
-# ✅ владелец (твой user_id) — только он сможет узнавать chat_id каналов/групп
+# ✅ владелец (может узнавать chat_id пересылкой)
 OWNER_ID = 277565921
+
+# ✅ каналы публикации (можно несколько)
+TARGET_CHANNELS = [-1003517837342]
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -36,16 +39,51 @@ async def is_chat_admin(user_id: int, chat_id: int) -> bool:
     member = await bot.get_chat_member(chat_id, user_id)
     return member.status in ("administrator", "creator")
 
+def extract_user_id_and_content(moderation_text: str) -> tuple[int | None, str]:
+    """
+    Разбираем сообщение в модерации:
+    🛡 Новая заявка
+    Отправитель ID: 123
+    ...
+    Текст (как будет опубликован):
+    <контент>
+    """
+    txt = moderation_text or ""
+    user_id = None
+
+    for line in txt.splitlines():
+        if line.startswith("Отправитель ID:"):
+            try:
+                user_id = int(line.replace("Отправитель ID:", "").strip())
+            except Exception:
+                user_id = None
+            break
+
+    marker = "Текст (как будет опубликован):"
+    content = txt.split(marker, 1)[1].strip() if marker in txt else txt
+    return user_id, content
+
+async def publish_to_channels(content: str) -> tuple[int, list[int]]:
+    ok = 0
+    failed = []
+    for ch in TARGET_CHANNELS:
+        try:
+            await bot.send_message(ch, content)
+            ok += 1
+        except Exception:
+            failed.append(ch)
+    return ok, failed
+
 
 # ---------- commands ----------
 @dp.message(CommandStart())
 async def start(m: Message):
     await m.answer(
         "Бот запущен ✅\n\n"
-        "Схема: пользователь → модерация → (дальше подключим публикацию в канал)\n\n"
-        "Команды:\n"
-        "/chatid — узнать chat_id текущего чата (пиши в нужной группе/канале, где есть бот)\n\n"
-        "Чтобы узнать chat_id канала без добавления бота — просто перешли мне пост из канала."
+        "Схема: пользователь → модерация → публикация в канал.\n"
+        "Отправь мне сообщение в личку — оно уйдет в модерацию.\n"
+        "После одобрения модератором будет опубликовано в канал(ы) без автора.\n\n"
+        "Команда: /chatid — узнать chat_id текущего чата."
     )
 
 @dp.message(Command("chatid"))
@@ -54,23 +92,18 @@ async def chatid(m: Message):
 
 
 # ---------- DEBUG: forwarded posts to get channel id ----------
-# Важно: этот хэндлер должен стоять ВЫШЕ общего incoming(),
-# чтобы успеть обработать пересланный пост.
 @dp.message()
 async def debug_forwarded(m: Message):
-    # Разрешаем только владельцу
     if not (m.from_user and m.from_user.id == OWNER_ID):
         return
 
-    # Если сообщение переслано из канала/группы, здесь будет объект forward_from_chat
     if m.forward_from_chat:
         title = m.forward_from_chat.title or "—"
         chat_id = m.forward_from_chat.id
         await m.answer(
             "✅ forward_from_chat найден\n"
             f"title: {title}\n"
-            f"chat_id: {chat_id}\n\n"
-            "Скопируй chat_id и пришли мне сюда — подключим публикацию в канал."
+            f"chat_id: {chat_id}"
         )
         return
 
@@ -78,17 +111,15 @@ async def debug_forwarded(m: Message):
 # ---------- user flow ----------
 @dp.message()
 async def incoming(m: Message):
-    # Игнорируем сообщения внутри модераторской группы (чтобы не плодить заявки)
+    # не создаём заявки из сообщений модераторского чата
     if m.chat.id == MOD_CHAT_ID:
         return
 
-    # Принимаем только текст (пока)
     text = (m.text or "").strip()
     if not text:
         await m.answer("Пришли текстовое сообщение 🙂")
         return
 
-    # request_id будем хранить как message_id в чате модерации (это и есть наша «БД»)
     mod_text = (
         "🛡 Новая заявка\n"
         f"Отправитель ID: {m.from_user.id}\n\n"
@@ -99,7 +130,6 @@ async def incoming(m: Message):
     msg = await bot.send_message(MOD_CHAT_ID, mod_text, reply_markup=mod_kb(request_id=0))
     request_id = msg.message_id
 
-    # обновим кнопки, чтобы в callback_data был правильный request_id
     await bot.edit_message_reply_markup(
         chat_id=MOD_CHAT_ID,
         message_id=request_id,
@@ -112,36 +142,34 @@ async def incoming(m: Message):
 # ---------- moderation actions ----------
 @dp.callback_query(F.data.startswith("approve:"))
 async def approve(cq: CallbackQuery):
-    # Доступ: только админы группы модерации
     if not await is_chat_admin(cq.from_user.id, MOD_CHAT_ID):
         await cq.answer("Нет доступа (только админы чата модерации).", show_alert=True)
         return
 
     request_id = int(cq.data.split(":")[1])
+    moderation_text = cq.message.text or ""
 
-    txt = cq.message.text or ""
-    lines = txt.splitlines()
+    user_id, content = extract_user_id_and_content(moderation_text)
 
-    # достаём user_id отправителя
-    user_id = None
-    for line in lines:
-        if line.startswith("Отправитель ID:"):
-            try:
-                user_id = int(line.replace("Отправитель ID:", "").strip())
-            except Exception:
-                user_id = None
+    # публикуем в канал(ы)
+    ok_count, failed = await publish_to_channels(content)
 
-    # достаём контент (после маркера)
-    marker = "Текст (как будет опубликован):"
-    content = txt.split(marker, 1)[1].strip() if marker in txt else txt
+    # обновляем сообщение модерации
+    status_line = f"✅ Одобрено и опубликовано: {ok_count}/{len(TARGET_CHANNELS)} канал(ов)"
+    if failed:
+        status_line += f"\n⚠️ Не удалось в: {', '.join(map(str, failed))}"
 
-    # ПОКА: просто отмечаем одобрение, публикацию в канал подключим следующим шагом
-    await cq.message.edit_text(f"✅ Одобрено (заявка #{request_id})\n\n{txt}")
-    await cq.answer("Одобрено.")
+    await cq.message.edit_text(
+        f"{status_line}\n"
+        f"(заявка #{request_id})\n\n"
+        f"{moderation_text}"
+    )
+    await cq.answer("Опубликовано.")
 
+    # уведомляем пользователя
     if user_id:
         try:
-            await bot.send_message(user_id, "✅ Ваша заявка одобрена модератором.")
+            await bot.send_message(user_id, "✅ Ваша заявка одобрена и опубликована.")
         except Exception:
             pass
 
@@ -153,19 +181,11 @@ async def reject(cq: CallbackQuery):
         return
 
     request_id = int(cq.data.split(":")[1])
+    moderation_text = cq.message.text or ""
 
-    txt = cq.message.text or ""
-    lines = txt.splitlines()
+    user_id, _ = extract_user_id_and_content(moderation_text)
 
-    user_id = None
-    for line in lines:
-        if line.startswith("Отправитель ID:"):
-            try:
-                user_id = int(line.replace("Отправитель ID:", "").strip())
-            except Exception:
-                user_id = None
-
-    await cq.message.edit_text(f"❌ Отклонено (заявка #{request_id})\n\n{txt}")
+    await cq.message.edit_text(f"❌ Отклонено (заявка #{request_id})\n\n{moderation_text}")
     await cq.answer("Отклонено.")
 
     if user_id:
