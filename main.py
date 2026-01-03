@@ -104,20 +104,18 @@ async def testpub(m: Message):
         await m.answer(text)
 
 
-@dp.message()
+@dp.message(F.forward_from_chat)
 async def debug_forwarded(m: Message):
     if not (m.from_user and m.from_user.id == OWNER_ID):
         return
 
-    if m.forward_from_chat:
-        title = m.forward_from_chat.title or "—"
-        chat_id = m.forward_from_chat.id
-        await m.answer(
-            "✅ forward_from_chat найден\n"
-            f"title: {title}\n"
-            f"chat_id: {chat_id}"
-        )
-        return
+    title = m.forward_from_chat.title or "—"
+    chat_id = m.forward_from_chat.id
+    await m.answer(
+        "✅ forward_from_chat найден\n"
+        f"title: {title}\n"
+        f"chat_id: {chat_id}"
+    )
 
 
 @dp.message()
